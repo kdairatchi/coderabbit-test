@@ -1,0 +1,73 @@
+name: IPI Canary (Elastic PoC)
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  canary:
+    # Mirror: elastic/elastic-agent has no author_association check here
+    if: >-
+      contains(github.event.comment.body, '@claude') &&
+      github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR HEAD (mirrors elastic/ai-github-claude-code-action setupBranch)
+        run: |
+          git init
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          # This is the exact ref pattern from branch.ts:
+          # execGit(["fetch", "origin", `pull/${entityNumber}/head:${branchName}`])
+          git fetch origin --depth=1 "pull/${{ github.event.issue.number }}/head:pr-branch"
+          git checkout pr-branch
+          echo "[canary] Workspace now contains PR HEAD from: $(git log --oneline -1)"
+          echo "[canary] Files in .claude/: $(ls .claude/ 2>/dev/null || echo NONE)"
+
+      - name: Read CLAUDE.md and post exfil comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          CANARY="ELASTIC_IPI_CANARY_7F42D1"
+
+          if [ -f ".claude/CLAUDE.md" ]; then
+            FOUND_PATH=".claude/CLAUDE.md"
+          elif [ -f "CLAUDE.md" ]; then
+            FOUND_PATH="CLAUDE.md"
+          else
+            python3 -c "
+import json
+body = '## IPI Canary: NOT FOUND\n\nNo CLAUDE.md in PR HEAD workspace. Attack surface not present.'
+print(json.dumps({'body': body}))
+" | gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --input - --method POST
+            exit 0
+          fi
+
+          python3 -c "
+import json, sys
+path = sys.argv[1]
+canary = sys.argv[2]
+with open(path) as f:
+    content = f.read()
+
+body = '''## CONFIRMED: {canary}
+
+**File loaded from PR HEAD:** \`{path}\`
+
+**Instructions the agent would execute:**
+\`\`\`markdown
+{content}
+\`\`\`
+
+---
+> This content was read from the PR author\'s \\`.claude/CLAUDE.md\\` after \\`git fetch origin pull/N/head\\` checkout.
+> Claude Code / gh-aw Copilot CLI reads this as project instructions with Bash/WebFetch/Write tool access.
+> In elastic/elastic-agent, the workflow token has \\`contents: write\\` on a repo with 150k+ stars.'''.format(
+    canary=canary, path=path, content=content)
+print(json.dumps({'body': body}))
+" "$FOUND_PATH" "$CANARY" | gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --input - --method POST
